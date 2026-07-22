@@ -69,6 +69,30 @@ It installs `scrcpy`/`adb` if missing, asks for resolution + DPI (defaults
 
 Then start DeX from DeXBar (or run `dex`). The DeX desktop opens in a window on your Mac.
 
+## Wireless (no cable)
+
+DeX can run over WiFi instead of USB. You bootstrap once over USB, then go cable-free
+as long as the phone and Mac share a WiFi network.
+
+```bash
+# 1) One-time setup: phone plugged in via USB (debugging authorized)
+./wireless.sh setup      # switches adb to WiFi, saves the phone IP, then you unplug
+
+# 2) Any time after: reconnect and launch DeX, no cable
+./wireless.sh start      # or: ./wireless.sh connect   (just reconnect)
+```
+
+Once the phone is connected wirelessly, **DeXBar's Start DeX works over WiFi too** —
+the app just uses whatever device `adb` sees.
+
+Notes:
+- The phone must stay on the same WiFi. After a **phone reboot**, TCP mode resets —
+  run `./wireless.sh setup` again with USB.
+- If you run a local proxy/VPN (**Surge, Clash, etc.**), it can hijack adb's connection
+  and cause `failed to connect: No route to host`. `wireless.sh` bypasses the proxy for
+  LAN addresses automatically; if you still hit it, add a **DIRECT** rule for your
+  `192.168.*` subnet in the proxy app.
+
 ## Tuning resolution / DPI
 
 At a given resolution, **lower DPI** packs more content on screen with smaller UI
