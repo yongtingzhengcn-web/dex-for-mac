@@ -18,7 +18,7 @@ just from a USB cable.
 ## Install
 
 ```bash
-git clone https://github.com/<your-username>/dex-for-mac.git
+git clone https://github.com/yongtingzhengcn-web/dex-for-mac.git
 cd dex-for-mac
 ./install.sh
 ```
