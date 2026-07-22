@@ -41,6 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var runningProcess: Process?
     private var connectedDevice: String?   // model name, or nil
+    private var deviceIsWireless = false    // true when connected over WiFi (adb tcpip)
 
     private let logPath = NSString(string: "~/Library/Logs/DeXBar.log").expandingTildeInPath
 
@@ -102,12 +103,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Parse `adb devices -l` output; return a friendly model name for the first
-    /// authorized device, or a sentinel string for unauthorized.
+    /// authorized device, or a sentinel string for unauthorized. Also records
+    /// whether that device is connected over WiFi (serial like `192.168.x.y:5555`).
     private func parseDevice(_ output: String) -> String? {
         for line in output.split(separator: "\n").dropFirst() {
             let s = String(line)
             if s.contains("unauthorized") { return "⚠︎ unauthorized" }
             if s.contains("\tdevice") || s.range(of: #"\sdevice(\s|$)"#, options: .regularExpression) != nil {
+                let serial = s.split(whereSeparator: { $0 == " " || $0 == "\t" }).first.map(String.init) ?? ""
+                deviceIsWireless = serial.contains(":")
                 if let range = s.range(of: #"model:(\S+)"#, options: .regularExpression) {
                     let model = String(s[range]).replacingOccurrences(of: "model:", with: "")
                     return model.replacingOccurrences(of: "_", with: " ")
@@ -115,6 +119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return "device"
             }
         }
+        deviceIsWireless = false
         return nil
     }
 
@@ -226,9 +231,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func startDeX() {
         guard let scrcpy = scrcpyPath, !isRunning else { return }
+        refreshDeviceStatus()   // ensure deviceIsWireless is current regardless of entry path
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: scrcpy)
-        proc.arguments = ["--new-display=\(selectedResolution)/\(selectedDPI)"]
+        var args = ["--new-display=\(selectedResolution)/\(selectedDPI)"]
+        // Over WiFi, tune for smoothness: h265 (lighter bandwidth), a small buffer
+        // to absorb jitter, a capped frame rate, and no audio overhead. USB stays lean.
+        if deviceIsWireless {
+            args += [
+                "--video-codec=h265",
+                "--video-bit-rate=8M",
+                "--max-fps=60",
+                "--video-buffer=50",
+                "--no-audio",
+            ]
+        }
+        proc.arguments = args
 
         // Ensure adb (a scrcpy dependency) is on PATH for the child.
         var env = ProcessInfo.processInfo.environment

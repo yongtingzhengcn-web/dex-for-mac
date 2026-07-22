@@ -83,7 +83,30 @@ as long as the phone and Mac share a WiFi network.
 ```
 
 Once the phone is connected wirelessly, **DeXBar's Start DeX works over WiFi too** —
-the app just uses whatever device `adb` sees.
+the app just uses whatever device `adb` sees, and automatically applies WiFi-tuned
+streaming settings (see below).
+
+### Smoothness over WiFi
+
+WiFi adds bandwidth variance and jitter, so both `wireless.sh start` and DeXBar
+(when the device is wireless) launch scrcpy with tuned flags:
+
+| Flag | Why |
+|------|-----|
+| `--video-codec=h265` | Better compression → less bandwidth → fewer dropped frames |
+| `--video-buffer=50` | Small buffer absorbs network jitter — the main stutter fix (≈50 ms latency) |
+| `--max-fps=60` | Caps capture rate for steady pacing |
+| `--video-bit-rate=8M` | Enough for a crisp desktop without saturating WiFi |
+| `--no-audio` | Drops audio-forwarding overhead |
+
+Override any of them for `wireless.sh` via env vars, e.g. keep audio and raise the
+buffer on a flaky network:
+
+```bash
+DEX_AUDIO="" DEX_BUFFER=120 DEX_BITRATE=6M ./wireless.sh start
+```
+
+USB launches stay lean (no buffer/latency added) since the link is already stable.
 
 Notes:
 - The phone must stay on the same WiFi. After a **phone reboot**, TCP mode resets —

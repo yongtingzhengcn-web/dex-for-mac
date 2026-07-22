@@ -18,6 +18,13 @@ elif [ -x /usr/local/bin/brew ]; then eval "$(/usr/local/bin/brew shellenv)"; fi
 PORT=5555
 RES="${DEX_RES:-2240x1260}"
 DPI="${DEX_DPI:-160}"
+# Wireless-tuned streaming defaults (override via env). h265 = lighter bandwidth,
+# video-buffer absorbs WiFi jitter, capped fps + moderate bitrate keep it stable.
+CODEC="${DEX_CODEC:-h265}"
+BITRATE="${DEX_BITRATE:-8M}"
+MAXFPS="${DEX_MAXFPS:-60}"
+BUFFER="${DEX_BUFFER:-50}"
+AUDIO_FLAG="${DEX_AUDIO:---no-audio}"   # set DEX_AUDIO="" to keep audio
 CFG_DIR="$HOME/.config-dex"
 IP_FILE="$CFG_DIR/phone_ip"
 mkdir -p "$CFG_DIR"
@@ -82,8 +89,13 @@ cmd_connect() {
 
 cmd_start() {
   cmd_connect
-  echo "Launching DeX (${RES}/${DPI}) ..."
-  nohup scrcpy --new-display="${RES}/${DPI}" >/tmp/dex_scrcpy.log 2>&1 &
+  echo "Launching DeX (${RES}/${DPI}, ${CODEC} ${BITRATE} ${MAXFPS}fps, buffer ${BUFFER}ms) ..."
+  nohup scrcpy --new-display="${RES}/${DPI}" \
+    --video-codec="${CODEC}" \
+    --video-bit-rate="${BITRATE}" \
+    --max-fps="${MAXFPS}" \
+    --video-buffer="${BUFFER}" \
+    ${AUDIO_FLAG} >/tmp/dex_scrcpy.log 2>&1 &
   disown
   echo "DeX starting. Log: /tmp/dex_scrcpy.log"
 }
