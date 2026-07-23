@@ -2,6 +2,10 @@
 
 **English** · [简体中文](README.zh-CN.md) · [한국어](README.ko.md) · [日本語](README.ja.md) · [Español](README.es.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [Português](README.pt.md)
 
+[![build](https://github.com/yongtingzhengcn-web/dex-for-mac/actions/workflows/build.yml/badge.svg)](https://github.com/yongtingzhengcn-web/dex-for-mac/actions/workflows/build.yml)
+[![Latest release](https://img.shields.io/github/v/release/yongtingzhengcn-web/dex-for-mac?sort=semver)](https://github.com/yongtingzhengcn-web/dex-for-mac/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 Run Samsung DeX on your Mac — no monitor, no HDMI dummy plug, no Miracast.
 
 Samsung dropped official DeX-on-PC support, but One UI 8 (Android 16) rebuilt DeX
@@ -23,6 +27,13 @@ just from a USB cable.
 
 A native menu-bar app: pick resolution/DPI, see whether your phone is connected,
 and start/stop DeX — all from the menu bar, no terminal.
+
+**Download a prebuilt build** from the [latest release](https://github.com/yongtingzhengcn-web/dex-for-mac/releases/latest),
+unzip, and move `DeXBar.app` to Applications. It's ad-hoc signed (not notarized), so on
+first launch **right-click the app → Open**, or allow it under *System Settings → Privacy
+& Security*.
+
+Or build it yourself:
 
 ```bash
 git clone https://github.com/yongtingzhengcn-web/dex-for-mac.git

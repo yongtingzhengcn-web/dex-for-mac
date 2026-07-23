@@ -42,6 +42,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var runningProcess: Process?
     private var connectedDevice: String?   // model name, or nil
     private var deviceIsWireless = false    // true when connected over WiFi (adb tcpip)
+    private var userRequestedStop = false   // distinguishes a user Stop from a crash
 
     private let logPath = NSString(string: "~/Library/Logs/DeXBar.log").expandingTildeInPath
 
@@ -75,52 +76,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenu()
     }
 
-    // Refresh device status each time the menu opens.
+    // Refresh device status each time the menu opens: show current state immediately,
+    // then update asynchronously once adb responds (adb can be slow over WiFi).
     func menuWillOpen(_ menu: NSMenu) {
-        refreshDeviceStatus()
         rebuildMenu()
+        queryDevices { [weak self] info in
+            guard let self else { return }
+            self.connectedDevice = info.model
+            self.deviceIsWireless = info.isWireless
+            self.rebuildMenu()
+        }
     }
 
     // MARK: - Device detection
 
-    private func refreshDeviceStatus() {
-        guard let adb = adbPath else { connectedDevice = nil; return }
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: adb)
-        proc.arguments = ["devices", "-l"]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = Pipe()
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let out = String(data: data, encoding: .utf8) ?? ""
-            connectedDevice = parseDevice(out)
-        } catch {
-            connectedDevice = nil
+    private struct DeviceInfo {
+        let model: String?     // friendly model name, "⚠︎ unauthorized", or nil if none
+        let isWireless: Bool   // connected over WiFi (adb tcpip), serial like 192.168.x.y:5555
+    }
+
+    /// Run `adb devices -l` off the main thread, then deliver the result on the main
+    /// thread. adb can block for seconds over flaky WiFi, so this must never run
+    /// synchronously on the main thread — that would freeze the menu bar UI.
+    private func queryDevices(_ completion: @escaping (DeviceInfo) -> Void) {
+        guard let adb = adbPath else { completion(DeviceInfo(model: nil, isWireless: false)); return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: adb)
+            proc.arguments = ["devices", "-l"]
+            let pipe = Pipe()
+            proc.standardOutput = pipe
+            proc.standardError = Pipe()
+            var info = DeviceInfo(model: nil, isWireless: false)
+            do {
+                try proc.run()
+                proc.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                info = Self.parseDevice(String(data: data, encoding: .utf8) ?? "")
+            } catch {
+                info = DeviceInfo(model: nil, isWireless: false)
+            }
+            DispatchQueue.main.async { completion(info) }
         }
     }
 
-    /// Parse `adb devices -l` output; return a friendly model name for the first
-    /// authorized device, or a sentinel string for unauthorized. Also records
-    /// whether that device is connected over WiFi (serial like `192.168.x.y:5555`).
-    private func parseDevice(_ output: String) -> String? {
+    /// Parse `adb devices -l` output into a model name and wireless flag. Pure (no
+    /// shared state), so it is safe to call off the main thread.
+    private static func parseDevice(_ output: String) -> DeviceInfo {
         for line in output.split(separator: "\n").dropFirst() {
             let s = String(line)
-            if s.contains("unauthorized") { return "⚠︎ unauthorized" }
+            if s.contains("unauthorized") { return DeviceInfo(model: "⚠︎ unauthorized", isWireless: false) }
             if s.contains("\tdevice") || s.range(of: #"\sdevice(\s|$)"#, options: .regularExpression) != nil {
                 let serial = s.split(whereSeparator: { $0 == " " || $0 == "\t" }).first.map(String.init) ?? ""
-                deviceIsWireless = serial.contains(":")
+                let isWireless = serial.contains(":")
                 if let range = s.range(of: #"model:(\S+)"#, options: .regularExpression) {
                     let model = String(s[range]).replacingOccurrences(of: "model:", with: "")
-                    return model.replacingOccurrences(of: "_", with: " ")
+                    return DeviceInfo(model: model.replacingOccurrences(of: "_", with: " "), isWireless: isWireless)
                 }
-                return "device"
+                return DeviceInfo(model: "device", isWireless: isWireless)
             }
         }
-        deviceIsWireless = false
-        return nil
+        return DeviceInfo(model: nil, isWireless: false)
     }
 
     private var isRunning: Bool {
@@ -230,8 +246,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func startDeX() {
+        guard scrcpyPath != nil, !isRunning else { return }
+        // Confirm connection / wireless state off the main thread, then launch —
+        // regardless of whether the menu was opened first.
+        queryDevices { [weak self] info in
+            guard let self else { return }
+            self.connectedDevice = info.model
+            self.deviceIsWireless = info.isWireless
+            self.launchScrcpy()
+        }
+    }
+
+    private func launchScrcpy() {
         guard let scrcpy = scrcpyPath, !isRunning else { return }
-        refreshDeviceStatus()   // ensure deviceIsWireless is current regardless of entry path
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: scrcpy)
         var args = ["--new-display=\(selectedResolution)/\(selectedDPI)"]
@@ -260,10 +287,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             proc.standardError = logHandle
         }
 
-        proc.terminationHandler = { [weak self] _ in
+        userRequestedStop = false
+        let launchDate = Date()
+        proc.terminationHandler = { [weak self] process in
             DispatchQueue.main.async {
-                self?.runningProcess = nil
-                self?.rebuildMenu()
+                guard let self else { return }
+                self.runningProcess = nil
+                self.rebuildMenu()
+                // If scrcpy died on its own within a couple of seconds, it almost
+                // certainly failed to start (device gone, unauthorized, etc.).
+                if !self.userRequestedStop,
+                   Date().timeIntervalSince(launchDate) < 2.5,
+                   process.terminationStatus != 0 {
+                    self.showLaunchFailure()
+                }
             }
         }
         do {
@@ -271,11 +308,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             runningProcess = proc
         } catch {
             runningProcess = nil
+            showLaunchFailure()
         }
         rebuildMenu()
     }
 
+    private func showLaunchFailure() {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Couldn't start DeX"
+        alert.informativeText = "scrcpy exited right after launching. Check that your phone is connected and USB debugging is authorized, then try again. See the log for details."
+        alert.addButton(withTitle: "Open Log")
+        alert.addButton(withTitle: "Dismiss")
+        if alert.runModal() == .alertFirstButtonReturn { openLog() }
+    }
+
     @objc private func stopDeX() {
+        userRequestedStop = true
         runningProcess?.terminate()
         runningProcess = nil
         rebuildMenu()
@@ -289,6 +338,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func quit() {
+        userRequestedStop = true
         runningProcess?.terminate()
         NSApp.terminate(nil)
     }
