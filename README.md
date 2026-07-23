@@ -136,6 +136,10 @@ resolution/density, which triggers One UI 8's Desktop Mode (DeX) to render onto 
 and mirrors that display to a window on your Mac over USB (or wireless adb). DeXBar is
 a thin native wrapper around exactly this command plus `adb devices` for status.
 
+## Support
+
+If this saved you some hassle, you can [buy me a coffee via PayPal](https://paypal.me/yongtingzheng741) ☕ — thanks!
+
 ## License
 
 MIT
