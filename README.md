@@ -138,7 +138,13 @@ a thin native wrapper around exactly this command plus `adb devices` for status.
 
 ## Support
 
-If this saved you some hassle, you can [buy me a coffee via PayPal](https://paypal.me/yongtingzheng741) ☕ — thanks!
+<p align="center">
+  <a href="https://paypal.me/yongtingzheng741">
+    <img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white" alt="Donate with PayPal" height="46">
+  </a>
+</p>
+
+<p align="center"><i>If this saved you some hassle, a coffee is always appreciated ☕ — thanks!</i></p>
 
 ## License
 
