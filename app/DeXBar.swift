@@ -330,8 +330,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         proc.standardError = pipe
         do {
             try proc.run()
-            proc.waitUntilExit()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
             return (proc.terminationStatus, String(data: data, encoding: .utf8) ?? "")
         } catch {
             return (-1, error.localizedDescription)
