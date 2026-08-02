@@ -42,6 +42,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var runningProcess: Process?
     private var isStarting = false
     private var ownsOverlayDisplay = false
+    private var activeDisplayID: Int?
+    private var activeDPI: Int?
+    private let dpiQueue = DispatchQueue(label: "DeXBar.dpi")
     private var connectedDevice: String?   // model name, or nil
     private var deviceIsWireless = false    // true when connected over WiFi (adb tcpip)
     private var userRequestedStop = false   // distinguishes a user Stop from a crash
@@ -218,6 +221,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             mi.target = self
             mi.representedObject = d
             mi.state = (d == selectedDPI) ? .on : .off
+            mi.isEnabled = !isStarting
             dpiMenu.addItem(mi)
         }
         dpiItem.submenu = dpiMenu
@@ -256,7 +260,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func pickDPI(_ sender: NSMenuItem) {
-        if let d = sender.representedObject as? Int { selectedDPI = d }
+        guard let dpi = sender.representedObject as? Int else { return }
+        selectedDPI = dpi
+        rebuildMenu()
+        guard isRunning, let displayID = activeDisplayID, let adb = adbPath else { return }
+        dpiQueue.async { [weak self] in
+            let result = Self.runADB(adb, ["shell", "wm", "density", "\(dpi)", "-d", "\(displayID)"])
+            DispatchQueue.main.async {
+                guard let self, self.activeDisplayID == displayID else { return }
+                if result.status == 0 {
+                    self.activeDPI = dpi
+                    return
+                }
+                guard self.selectedDPI == dpi else { return }
+                self.selectedDPI = self.activeDPI ?? self.selectedDPI
+                self.rebuildMenu()
+                self.showDPIFailure(result.output)
+            }
+        }
     }
 
     @objc private func toggleScreenOff() {
@@ -398,6 +419,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.runningProcess = nil
+                self.activeDisplayID = nil
+                self.activeDPI = nil
                 self.cleanupOverlayDisplay()
                 self.rebuildMenu()
                 // If scrcpy died on its own within a couple of seconds, it almost
@@ -412,8 +435,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         do {
             try proc.run()
             runningProcess = proc
+            activeDisplayID = displayID
+            activeDPI = selectedDPI
         } catch {
             runningProcess = nil
+            activeDisplayID = nil
+            activeDPI = nil
             cleanupOverlayDisplay()
             showLaunchFailure()
         }
@@ -439,10 +466,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.runModal()
     }
 
+    private func showDPIFailure(_ detail: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Couldn't change DPI"
+        alert.informativeText = detail.isEmpty ? "The device rejected the display density change." : detail
+        alert.addButton(withTitle: "Dismiss")
+        alert.runModal()
+    }
+
     @objc private func stopDeX() {
         userRequestedStop = true
         runningProcess?.terminate()
         runningProcess = nil
+        activeDisplayID = nil
+        activeDPI = nil
         cleanupOverlayDisplay()
         rebuildMenu()
     }
@@ -457,6 +495,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func quit() {
         userRequestedStop = true
         runningProcess?.terminate()
+        activeDisplayID = nil
+        activeDPI = nil
         cleanupOverlayDisplay()
         NSApp.terminate(nil)
     }
