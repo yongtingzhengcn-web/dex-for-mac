@@ -1,4 +1,5 @@
 import AppKit
+import UserNotifications
 
 // MARK: - Tool discovery
 
@@ -40,6 +41,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var adbPath: String?
 
     private var runningProcess: Process?
+    private var isStarting = false
+    private var ownsOverlayDisplay = false
+    private var activeDisplayID: Int?
+    private var activeDPI: Int?
+    private let dpiQueue = DispatchQueue(label: "DeXBar.dpi")
     private var connectedDevice: String?   // model name, or nil
     private var deviceIsWireless = false    // true when connected over WiFi (adb tcpip)
     private var userRequestedStop = false   // distinguishes a user Stop from a crash
@@ -61,10 +67,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         set { UserDefaults.standard.set(newValue, forKey: "dpi") }
     }
+    private var turnScreenOff: Bool {
+        get { UserDefaults.standard.bool(forKey: "turnScreenOff") }
+        set { UserDefaults.standard.set(newValue, forKey: "turnScreenOff") }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         scrcpyPath = findBinary("scrcpy")
         adbPath = findBinary("adb")
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
@@ -165,6 +176,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let statusTitle: String
         if isRunning {
             statusTitle = "● DeX running"
+        } else if isStarting {
+            statusTitle = "Starting DeX…"
         } else if let dev = connectedDevice {
             statusTitle = dev == "⚠︎ unauthorized" ? "⚠︎ USB debugging not authorized" : "Connected: \(dev)"
         } else {
@@ -184,7 +197,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let start = NSMenuItem(title: "Start DeX", action: #selector(startDeX), keyEquivalent: "d")
             start.target = self
             let canStart = connectedDevice != nil && connectedDevice != "⚠︎ unauthorized"
-            start.isEnabled = canStart
+            start.isEnabled = canStart && !isStarting
             menu.addItem(start)
         }
         menu.addItem(.separator())
@@ -210,10 +223,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             mi.target = self
             mi.representedObject = d
             mi.state = (d == selectedDPI) ? .on : .off
+            mi.isEnabled = !isStarting
             dpiMenu.addItem(mi)
         }
         dpiItem.submenu = dpiMenu
         menu.addItem(dpiItem)
+
+        let screenOffItem = NSMenuItem(title: "Turn phone screen off (-S)", action: #selector(toggleScreenOff), keyEquivalent: "")
+        screenOffItem.target = self
+        screenOffItem.state = turnScreenOff ? .on : .off
+        screenOffItem.isEnabled = !isRunning && !isStarting
+        menu.addItem(screenOffItem)
 
         // Current config line
         let cfg = NSMenuItem(title: "Current: \(selectedResolution) / \(selectedDPI)", action: nil, keyEquivalent: "")
@@ -242,26 +262,134 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func pickDPI(_ sender: NSMenuItem) {
-        if let d = sender.representedObject as? Int { selectedDPI = d }
+        guard let dpi = sender.representedObject as? Int else { return }
+        selectedDPI = dpi
+        rebuildMenu()
+        guard isRunning, let displayID = activeDisplayID, let adb = adbPath else { return }
+        dpiQueue.async { [weak self] in
+            let result = Self.runADB(adb, ["shell", "wm", "density", "\(dpi)", "-d", "\(displayID)"])
+            DispatchQueue.main.async {
+                guard let self, self.activeDisplayID == displayID else { return }
+                if result.status == 0 {
+                    self.activeDPI = dpi
+                    return
+                }
+                guard self.selectedDPI == dpi else { return }
+                self.selectedDPI = self.activeDPI ?? self.selectedDPI
+                self.rebuildMenu()
+                self.showDPIFailure(result.output)
+            }
+        }
+    }
+
+    @objc private func toggleScreenOff() {
+        turnScreenOff.toggle()
+        rebuildMenu()
     }
 
     @objc private func startDeX() {
-        guard scrcpyPath != nil, !isRunning else { return }
+        guard scrcpyPath != nil, adbPath != nil, !isRunning, !isStarting else { return }
+        isStarting = true
+        rebuildMenu()
         // Confirm connection / wireless state off the main thread, then launch —
         // regardless of whether the menu was opened first.
         queryDevices { [weak self] info in
             guard let self else { return }
             self.connectedDevice = info.model
             self.deviceIsWireless = info.isWireless
-            self.launchScrcpy()
+            guard info.model != nil, info.model != "⚠︎ unauthorized" else {
+                self.isStarting = false
+                self.rebuildMenu()
+                return
+            }
+            self.createOverlayDisplay { [weak self] displayID in
+                guard let self else { return }
+                self.isStarting = false
+                guard let displayID else {
+                    self.rebuildMenu()
+                    self.showDisplayFailure()
+                    return
+                }
+                self.ownsOverlayDisplay = true
+                self.launchScrcpy(displayID: displayID)
+            }
         }
     }
 
-    private func launchScrcpy() {
+    private func createOverlayDisplay(_ completion: @escaping (Int?) -> Void) {
+        guard let adb = adbPath else { completion(nil); return }
+        let resolution = selectedResolution
+        let dpi = selectedDPI
+        DispatchQueue.global(qos: .userInitiated).async {
+            let before = Self.displayIDs(adb: adb)
+            let value = "\(resolution)/\(dpi),hdmi"
+            let applied = Self.runADB(adb, ["shell", "settings", "put", "global", "overlay_display_devices", value])
+            guard applied.status == 0 else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+
+            let deadline = Date().addingTimeInterval(5)
+            var displayID: Int?
+            repeat {
+                Thread.sleep(forTimeInterval: 0.25)
+                let newIDs = Self.displayIDs(adb: adb).subtracting(before)
+                if newIDs.count == 1 {
+                    displayID = newIDs.first
+                    break
+                }
+            } while Date() < deadline
+
+            if displayID == nil {
+                _ = Self.runADB(adb, ["shell", "settings", "delete", "global", "overlay_display_devices"])
+            }
+            DispatchQueue.main.async { completion(displayID) }
+        }
+    }
+
+    private static func displayIDs(adb: String) -> Set<Int> {
+        let result = runADB(adb, ["shell", "dumpsys", "display"])
+        guard result.status == 0 else { return [] }
+        let regex = try? NSRegularExpression(pattern: #"mDisplayId\s*=\s*(\d+)"#)
+        let range = NSRange(result.output.startIndex..., in: result.output)
+        let matches = regex?.matches(in: result.output, range: range) ?? []
+        return Set(matches.compactMap { match in
+            guard let range = Range(match.range(at: 1), in: result.output) else { return nil }
+            return Int(result.output[range])
+        }.filter { $0 > 0 })
+    }
+
+    private static func runADB(_ adb: String, _ arguments: [String]) -> (status: Int32, output: String) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: adb)
+        proc.arguments = arguments
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        do {
+            try proc.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            return (proc.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+        } catch {
+            return (-1, error.localizedDescription)
+        }
+    }
+
+    private func cleanupOverlayDisplay() {
+        guard ownsOverlayDisplay, let adb = adbPath else { return }
+        ownsOverlayDisplay = false
+        DispatchQueue.global(qos: .utility).async {
+            _ = Self.runADB(adb, ["shell", "settings", "delete", "global", "overlay_display_devices"])
+        }
+    }
+
+    private func launchScrcpy(displayID: Int) {
         guard let scrcpy = scrcpyPath, !isRunning else { return }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: scrcpy)
-        var args = ["--new-display=\(selectedResolution)/\(selectedDPI)"]
+        var args = ["--display-id=\(displayID)"]
+        if turnScreenOff { args.append("-S") }
         // Over WiFi, tune for smoothness: h265 (lighter bandwidth), a small buffer
         // to absorb jitter, a capped frame rate, and no audio overhead. USB stays lean.
         if deviceIsWireless {
@@ -293,21 +421,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.runningProcess = nil
+                self.activeDisplayID = nil
+                self.activeDPI = nil
+                self.cleanupOverlayDisplay()
                 self.rebuildMenu()
                 // If scrcpy died on its own within a couple of seconds, it almost
                 // certainly failed to start (device gone, unauthorized, etc.).
-                if !self.userRequestedStop,
-                   Date().timeIntervalSince(launchDate) < 2.5,
-                   process.terminationStatus != 0 {
-                    self.showLaunchFailure()
+                if !self.userRequestedStop, process.terminationStatus != 0 {
+                    if Date().timeIntervalSince(launchDate) < 2.5 {
+                        self.showLaunchFailure()
+                    } else {
+                        self.showUnexpectedDisconnectNotification()
+                    }
                 }
             }
         }
         do {
             try proc.run()
             runningProcess = proc
+            activeDisplayID = displayID
+            activeDPI = selectedDPI
         } catch {
             runningProcess = nil
+            activeDisplayID = nil
+            activeDPI = nil
+            cleanupOverlayDisplay()
             showLaunchFailure()
         }
         rebuildMenu()
@@ -323,10 +461,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if alert.runModal() == .alertFirstButtonReturn { openLog() }
     }
 
+    private func showDisplayFailure() {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Couldn't create DeX display"
+        alert.informativeText = "The HDMI virtual display did not appear. Check that your phone is connected and USB debugging is authorized, then try again."
+        alert.addButton(withTitle: "Dismiss")
+        alert.runModal()
+    }
+
+    private func showDPIFailure(_ detail: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Couldn't change DPI"
+        alert.informativeText = detail.isEmpty ? "The device rejected the display density change." : detail
+        alert.addButton(withTitle: "Dismiss")
+        alert.runModal()
+    }
+
+    private func showUnexpectedDisconnectNotification() {
+        let content = UNMutableNotificationContent()
+        content.title = "DeX disconnected unexpectedly"
+        content.body = "A virtual display may remain on the phone. Open Settings → Developer options → Simulate secondary displays, toggle it, then return it to None."
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
+
     @objc private func stopDeX() {
         userRequestedStop = true
         runningProcess?.terminate()
         runningProcess = nil
+        activeDisplayID = nil
+        activeDPI = nil
+        cleanupOverlayDisplay()
         rebuildMenu()
     }
 
@@ -340,6 +508,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func quit() {
         userRequestedStop = true
         runningProcess?.terminate()
+        activeDisplayID = nil
+        activeDPI = nil
+        cleanupOverlayDisplay()
         NSApp.terminate(nil)
     }
 
