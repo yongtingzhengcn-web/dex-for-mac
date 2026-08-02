@@ -63,6 +63,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         set { UserDefaults.standard.set(newValue, forKey: "dpi") }
     }
+    private var turnScreenOff: Bool {
+        get { UserDefaults.standard.bool(forKey: "turnScreenOff") }
+        set { UserDefaults.standard.set(newValue, forKey: "turnScreenOff") }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         scrcpyPath = findBinary("scrcpy")
@@ -219,6 +223,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         dpiItem.submenu = dpiMenu
         menu.addItem(dpiItem)
 
+        let screenOffItem = NSMenuItem(title: "Turn phone screen off (-S)", action: #selector(toggleScreenOff), keyEquivalent: "")
+        screenOffItem.target = self
+        screenOffItem.state = turnScreenOff ? .on : .off
+        screenOffItem.isEnabled = !isRunning && !isStarting
+        menu.addItem(screenOffItem)
+
         // Current config line
         let cfg = NSMenuItem(title: "Current: \(selectedResolution) / \(selectedDPI)", action: nil, keyEquivalent: "")
         cfg.isEnabled = false
@@ -247,6 +257,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func pickDPI(_ sender: NSMenuItem) {
         if let d = sender.representedObject as? Int { selectedDPI = d }
+    }
+
+    @objc private func toggleScreenOff() {
+        turnScreenOff.toggle()
+        rebuildMenu()
     }
 
     @objc private func startDeX() {
@@ -351,6 +366,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: scrcpy)
         var args = ["--display-id=\(displayID)"]
+        if turnScreenOff { args.append("-S") }
         // Over WiFi, tune for smoothness: h265 (lighter bandwidth), a small buffer
         // to absorb jitter, a capped frame rate, and no audio overhead. USB stays lean.
         if deviceIsWireless {
