@@ -45,9 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var ownsOverlayDisplay = false
     private var activeDisplayID: Int?
     private var activeDPI: Int?
-    private var activeScreenOff: Bool?
     private let dpiQueue = DispatchQueue(label: "DeXBar.dpi")
-    private let screenPowerQueue = DispatchQueue(label: "DeXBar.screenPower")
     private var connectedDevice: String?   // model name, or nil
     private var deviceIsWireless = false    // true when connected over WiFi (adb tcpip)
     private var userRequestedStop = false   // distinguishes a user Stop from a crash
@@ -234,7 +232,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let screenOffItem = NSMenuItem(title: "Turn phone screen off (-S)", action: #selector(toggleScreenOff), keyEquivalent: "")
         screenOffItem.target = self
         screenOffItem.state = turnScreenOff ? .on : .off
-        screenOffItem.isEnabled = !isStarting
+        screenOffItem.isEnabled = !isRunning && !isStarting
         menu.addItem(screenOffItem)
 
         // Current config line
@@ -287,23 +285,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleScreenOff() {
         turnScreenOff.toggle()
         rebuildMenu()
-        guard isRunning, let adb = adbPath else { return }
-        let screenOff = turnScreenOff
-        let keyCode = screenOff ? "KEYCODE_SLEEP" : "KEYCODE_WAKEUP"
-        screenPowerQueue.async { [weak self] in
-            let result = Self.runADB(adb, ["shell", "input", "keyevent", keyCode])
-            DispatchQueue.main.async {
-                guard let self, self.isRunning else { return }
-                if result.status == 0 {
-                    self.activeScreenOff = screenOff
-                    return
-                }
-                guard self.turnScreenOff == screenOff else { return }
-                self.turnScreenOff = self.activeScreenOff ?? self.turnScreenOff
-                self.rebuildMenu()
-                self.showScreenPowerFailure(result.output)
-            }
-        }
     }
 
     @objc private func startDeX() {
@@ -442,7 +423,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.runningProcess = nil
                 self.activeDisplayID = nil
                 self.activeDPI = nil
-                self.activeScreenOff = nil
                 self.cleanupOverlayDisplay()
                 self.rebuildMenu()
                 // If scrcpy died on its own within a couple of seconds, it almost
@@ -461,12 +441,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             runningProcess = proc
             activeDisplayID = displayID
             activeDPI = selectedDPI
-            activeScreenOff = turnScreenOff
         } catch {
             runningProcess = nil
             activeDisplayID = nil
             activeDPI = nil
-            activeScreenOff = nil
             cleanupOverlayDisplay()
             showLaunchFailure()
         }
@@ -501,15 +479,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.runModal()
     }
 
-    private func showScreenPowerFailure(_ detail: String) {
-        NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.messageText = "Couldn't change phone screen power"
-        alert.informativeText = detail.isEmpty ? "The device rejected the screen power change." : detail
-        alert.addButton(withTitle: "Dismiss")
-        alert.runModal()
-    }
-
     private func showUnexpectedDisconnectNotification() {
         let content = UNMutableNotificationContent()
         content.title = "DeX disconnected unexpectedly"
@@ -525,7 +494,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         runningProcess = nil
         activeDisplayID = nil
         activeDPI = nil
-        activeScreenOff = nil
         cleanupOverlayDisplay()
         rebuildMenu()
     }
@@ -542,7 +510,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         runningProcess?.terminate()
         activeDisplayID = nil
         activeDPI = nil
-        activeScreenOff = nil
         cleanupOverlayDisplay()
         NSApp.terminate(nil)
     }
