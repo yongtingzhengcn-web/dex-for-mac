@@ -21,7 +21,7 @@ jobs:
         run: swift --version
 
       - name: Build
-        run: ./app/build.sh
+        run: ./app/build.sh "" "${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}"
 
       - name: Package (.zip)
         run: |
@@ -45,7 +45,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build
-        run: ./app/build.sh
+        run: ./app/build.sh "" "${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}"
 
       - name: Package (.zip)
         run: |
@@ -58,7 +58,7 @@ jobs:
           files: app/build/DeXBar-macos.zip
           generate_release_notes: true
           body: |
-            Prebuilt **DeXBar.app** for macOS (Apple Silicon / Intel universal via the runner).
+            Prebuilt **DeXBar.app** for macOS — universal binary (Apple Silicon + Intel).
 
             The app is ad-hoc signed, not notarized. On first launch, right-click the app
             and choose **Open**, or allow it under **System Settings → Privacy & Security**.

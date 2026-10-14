@@ -18,6 +18,10 @@ elif [ -x /usr/local/bin/brew ]; then eval "$(/usr/local/bin/brew shellenv)"; fi
 PORT=5555
 RES="${DEX_RES:-2240x1260}"
 DPI="${DEX_DPI:-160}"
+# Display creation mode: auto (detect One UI version), new-display, or overlay.
+# One UI 8.5 broke full DeX over --new-display (apps open fullscreen without
+# window chrome); the overlay path works there — see start_overlay().
+MODE="${DEX_MODE:-auto}"
 # Wireless-tuned streaming defaults (override via env). h265 = lighter bandwidth,
 # video-buffer absorbs WiFi jitter, capped fps + moderate bitrate keep it stable.
 CODEC="${DEX_CODEC:-h265}"
@@ -46,6 +50,10 @@ phone_ip_from_usb() {
 # Restart the adb server cleanly. A stale server caches "no route to host"
 # after a proxy hiccup; a fresh start fixes wireless connects.
 adb_reset() { adb kill-server >/dev/null 2>&1 || true; adb start-server >/dev/null 2>&1 || true; }
+
+oneui_version() { adb shell getprop ro.build.version.oneui 2>/dev/null | tr -d '\r'; }
+
+display_ids() { adb shell dumpsys display 2>/dev/null | grep -o 'mDisplayId=[0-9]*' | cut -d= -f2 | sort -u; }
 
 cmd_setup() {
   local s; s="$(usb_serial)"
@@ -87,17 +95,61 @@ cmd_connect() {
   do_connect "$(cat "$IP_FILE")"
 }
 
+stream_flags() {
+  echo "--video-codec=${CODEC} --video-bit-rate=${BITRATE} --max-fps=${MAXFPS} --video-buffer=${BUFFER} ${AUDIO_FLAG}"
+}
+
+# One UI 8.5+ path: an overlay display tagged "hdmi" is treated by One UI as an
+# external monitor, so full DeX (window chrome, multi-window) starts on it.
+# We then attach scrcpy to that display id, and remove the overlay on exit.
+start_overlay() {
+  local before now newid=""
+  before="$(display_ids)"
+  adb shell settings put global overlay_display_devices "${RES}/${DPI},hdmi"
+  for _ in $(seq 1 12); do
+    sleep 0.5
+    now="$(display_ids)"
+    newid="$(comm -13 <(echo "$before") <(echo "$now") | head -1)"
+    [ -n "$newid" ] && break
+  done
+  if [ -z "$newid" ]; then
+    echo "Failed to create overlay display; cleaning up."
+    adb shell settings delete global overlay_display_devices
+    exit 1
+  fi
+  echo "Overlay display id: ${newid}"
+  # shellcheck disable=SC2046
+  nohup scrcpy --display-id="${newid}" $(stream_flags) >/tmp/dex_scrcpy.log 2>&1 &
+  disown
+  echo "DeX starting (overlay). Log: /tmp/dex_scrcpy.log"
+  echo "Stop later with: adb shell settings delete global overlay_display_devices"
+}
+
+start_new_display() {
+  # shellcheck disable=SC2046
+  nohup scrcpy --new-display="${RES}/${DPI}" $(stream_flags) >/tmp/dex_scrcpy.log 2>&1 &
+  disown
+  echo "DeX starting (--new-display). Log: /tmp/dex_scrcpy.log"
+}
+
 cmd_start() {
   cmd_connect
+  local mode="$MODE"
+  if [ "$mode" = "auto" ]; then
+    local v; v="$(oneui_version)"
+    if [ -n "$v" ] && awk -v v="$v" 'BEGIN{exit !(v+0 >= 8.5)}'; then
+      mode="overlay"
+    else
+      mode="new-display"
+    fi
+    echo "One UI ${v:-unknown} -> ${mode} mode"
+  fi
   echo "Launching DeX (${RES}/${DPI}, ${CODEC} ${BITRATE} ${MAXFPS}fps, buffer ${BUFFER}ms) ..."
-  nohup scrcpy --new-display="${RES}/${DPI}" \
-    --video-codec="${CODEC}" \
-    --video-bit-rate="${BITRATE}" \
-    --max-fps="${MAXFPS}" \
-    --video-buffer="${BUFFER}" \
-    ${AUDIO_FLAG} >/tmp/dex_scrcpy.log 2>&1 &
-  disown
-  echo "DeX starting. Log: /tmp/dex_scrcpy.log"
+  case "$mode" in
+    overlay)     start_overlay ;;
+    new-display) start_new_display ;;
+    *) echo "Unknown DEX_MODE: $mode (auto|new-display|overlay)"; exit 1 ;;
+  esac
 }
 
 cmd_status() { adb devices -l; }

@@ -54,6 +54,10 @@ Click the display icon in the menu bar:
 - **Status line** — shows the connected device model, or a warning if USB debugging
   isn't authorized / no device is connected.
 - **Start / Stop DeX** — launches or kills the scrcpy virtual-display session.
+- **Device** — pick which phone to use when several are connected.
+- **Display mode** — Auto (detect One UI version), Virtual display, or Overlay
+  (see the One UI 8.5 note below). Wireless sessions reconnect automatically if
+  the WiFi link drops.
 - **Resolution** / **DPI** — pick from presets; your choice is remembered.
 - **Open Log** — opens `~/Library/Logs/DeXBar.log`.
 
@@ -136,16 +140,33 @@ elements; **higher DPI** makes everything larger. `1920x1080/160` is a reasonabl
 desktop-like default. In DeXBar, just pick from the menus. For `install.sh`, re-run it
 or edit the `--new-display=WIDTHxHEIGHT/DPI` value in the `dex` alias (`~/.zshrc`).
 
+## One UI 8.5 note
+
+On **One UI 8.5**, `scrcpy --new-display` no longer starts full DeX — you get
+Android's plain Desktop Mode instead (apps open fullscreen, no window title bars,
+no multi-window). This project works around it by creating an `hdmi`-tagged
+[overlay display](https://github.com/yongtingzhengcn-web/dex-for-mac/issues/1)
+(`settings put global overlay_display_devices "WxH/DPI,hdmi"`), which One UI treats
+as an external monitor so full DeX starts on it, then attaching scrcpy to that
+display id.
+
+You don't have to do anything: **DeXBar** and **wireless.sh** auto-detect the One UI
+version and pick the right path. In DeXBar you can also force a mode via
+*Display mode* → `Virtual display (One UI 8.0)` / `Overlay display (One UI 8.5+)`.
+
 ## How it works
 
 ```bash
-scrcpy --new-display=1920x1080/160
+scrcpy --new-display=1920x1080/160          # One UI 8.0
+# or, on One UI 8.5+:
+adb shell settings put global overlay_display_devices "1920x1080/160,hdmi"
+scrcpy --display-id=<id from dumpsys display>
 ```
 
-This one command creates a new virtual display on the phone at the given
+The first command creates a new virtual display on the phone at the given
 resolution/density, which triggers One UI 8's Desktop Mode (DeX) to render onto it,
 and mirrors that display to a window on your Mac over USB (or wireless adb). DeXBar is
-a thin native wrapper around exactly this command plus `adb devices` for status.
+a thin native wrapper around these commands plus `adb devices` for status.
 
 ## Support
 

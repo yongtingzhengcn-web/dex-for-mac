@@ -30,6 +30,61 @@ func findBinary(_ name: String) -> String? {
     return nil
 }
 
+// MARK: - Process helper
+
+/// Mutable flag shared with the timeout watchdog (see runProcess).
+private final class Flag { var value = false }
+
+/// Run a command off the main thread with a hard timeout, then deliver
+/// (terminationStatus, stdout) on the main thread. Status is -1 when the process
+/// could not be launched and -2 when it was killed for exceeding `timeout`.
+/// adb can block for seconds over flaky WiFi, so every adb call goes through here —
+/// it must never be waited on synchronously from the main thread.
+func runProcess(_ path: String, _ args: [String], timeout: TimeInterval,
+                completion: @escaping (Int32, String) -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: path)
+        proc.arguments = args
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+        } catch {
+            DispatchQueue.main.async { completion(-1, "") }
+            return
+        }
+        let timedOut = Flag()
+        let watchdog = DispatchWorkItem {
+            if proc.isRunning { timedOut.value = true; proc.terminate() }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
+        proc.waitUntilExit()
+        watchdog.cancel()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let out = String(data: data, encoding: .utf8) ?? ""
+        let status = timedOut.value ? -2 : proc.terminationStatus
+        DispatchQueue.main.async { completion(status, out) }
+    }
+}
+
+// MARK: - Display mode
+
+/// How the DeX desktop display is created on the phone.
+enum DisplayMode: Equatable {
+    /// scrcpy creates the virtual display itself. Full DeX on One UI 8.0, but on
+    /// One UI 8.5 this only yields Android's plain Desktop Mode (no window chrome,
+    /// no multi-window).
+    case newDisplay
+    /// An `overlay_display_devices` entry tagged `hdmi` makes One UI treat the
+    /// display as an external monitor → full DeX even on One UI 8.5. scrcpy then
+    /// attaches to that display by id.
+    case overlay(String)   // carries the created display id
+
+    var isOverlay: Bool { if case .overlay = self { return true }; return false }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -40,15 +95,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var adbPath: String?
 
     private var runningProcess: Process?
-    private var connectedDevice: String?   // model name, or nil
-    private var deviceIsWireless = false    // true when connected over WiFi (adb tcpip)
+    private var devices: [DeviceInfo] = []
     private var userRequestedStop = false   // distinguishes a user Stop from a crash
+
+    // Session bookkeeping (captured at launch, used by the termination handler)
+    private var sessionSerial: String?
+    private var sessionWasWireless = false
+    private var activeDisplayMode: DisplayMode?
+    private var overlayInUse = false        // an overlay_display_devices entry is ours
+    private var reconnectAttempts = 0       // wireless auto-reconnect budget
+    private var triedOverlayFallback = false // new-display fast-fail → retry as overlay
+
+    private let maxReconnectAttempts = 2
 
     private let logPath = NSString(string: "~/Library/Logs/DeXBar.log").expandingTildeInPath
 
     // Presets
     private let resolutions = ["1920x1080", "2240x1260", "2560x1440", "3840x2160"]
     private let dpis = [120, 140, 160, 200, 240, 284]
+    private let displayModePrefs = ["auto", "new-display", "overlay"]
 
     private var selectedResolution: String {
         get { UserDefaults.standard.string(forKey: "resolution") ?? "2240x1260" }
@@ -61,6 +126,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         set { UserDefaults.standard.set(newValue, forKey: "dpi") }
     }
+    /// Display-mode preference: "auto" (detect One UI version), "new-display",
+    /// or "overlay" (force the One UI 8.5-compatible path).
+    private var displayModePref: String {
+        get { UserDefaults.standard.string(forKey: "displayMode") ?? "auto" }
+        set { UserDefaults.standard.set(newValue, forKey: "displayMode") }
+    }
+    private var selectedSerial: String? {
+        get { UserDefaults.standard.string(forKey: "serial") }
+        set { UserDefaults.standard.set(newValue, forKey: "serial") }
+    }
+    /// The device the session targets: the user's pick if still connected, else the
+    /// first authorized device.
+    private var selectedDevice: DeviceInfo? {
+        let usable = devices.filter { !$0.unauthorized }
+        if let s = selectedSerial, let d = usable.first(where: { $0.serial == s }) { return d }
+        return usable.first
+    }
+    private var hasUnauthorized: Bool { devices.contains { $0.unauthorized } }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         scrcpyPath = findBinary("scrcpy")
@@ -80,67 +163,157 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // then update asynchronously once adb responds (adb can be slow over WiFi).
     func menuWillOpen(_ menu: NSMenu) {
         rebuildMenu()
-        queryDevices { [weak self] info in
+        queryDevices { [weak self] found in
             guard let self else { return }
-            self.connectedDevice = info.model
-            self.deviceIsWireless = info.isWireless
+            self.devices = found
             self.rebuildMenu()
         }
     }
 
     // MARK: - Device detection
 
-    private struct DeviceInfo {
-        let model: String?     // friendly model name, "⚠︎ unauthorized", or nil if none
+    struct DeviceInfo {
+        let model: String      // friendly model name
+        let serial: String     // adb serial (USB id or ip:port)
         let isWireless: Bool   // connected over WiFi (adb tcpip), serial like 192.168.x.y:5555
+        let unauthorized: Bool // plugged in but USB debugging not approved
     }
 
-    /// Run `adb devices -l` off the main thread, then deliver the result on the main
-    /// thread. adb can block for seconds over flaky WiFi, so this must never run
-    /// synchronously on the main thread — that would freeze the menu bar UI.
-    private func queryDevices(_ completion: @escaping (DeviceInfo) -> Void) {
-        guard let adb = adbPath else { completion(DeviceInfo(model: nil, isWireless: false)); return }
-        DispatchQueue.global(qos: .userInitiated).async {
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: adb)
-            proc.arguments = ["devices", "-l"]
-            let pipe = Pipe()
-            proc.standardOutput = pipe
-            proc.standardError = Pipe()
-            var info = DeviceInfo(model: nil, isWireless: false)
-            do {
-                try proc.run()
-                proc.waitUntilExit()
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                info = Self.parseDevice(String(data: data, encoding: .utf8) ?? "")
-            } catch {
-                info = DeviceInfo(model: nil, isWireless: false)
-            }
-            DispatchQueue.main.async { completion(info) }
+    /// Run `adb devices -l` (with timeout) off the main thread, deliver on main.
+    private func queryDevices(_ completion: @escaping ([DeviceInfo]) -> Void) {
+        guard let adb = adbPath else { completion([]); return }
+        runProcess(adb, ["devices", "-l"], timeout: 6) { _, out in
+            completion(Self.parseDevices(out))
         }
     }
 
-    /// Parse `adb devices -l` output into a model name and wireless flag. Pure (no
-    /// shared state), so it is safe to call off the main thread.
-    private static func parseDevice(_ output: String) -> DeviceInfo {
+    /// Parse `adb devices -l` output. Pure (no shared state), safe off the main thread.
+    static func parseDevices(_ output: String) -> [DeviceInfo] {
+        var result: [DeviceInfo] = []
         for line in output.split(separator: "\n").dropFirst() {
             let s = String(line)
-            if s.contains("unauthorized") { return DeviceInfo(model: "⚠︎ unauthorized", isWireless: false) }
-            if s.contains("\tdevice") || s.range(of: #"\sdevice(\s|$)"#, options: .regularExpression) != nil {
-                let serial = s.split(whereSeparator: { $0 == " " || $0 == "\t" }).first.map(String.init) ?? ""
-                let isWireless = serial.contains(":")
+            let parts = s.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+            guard parts.count >= 2 else { continue }
+            let serial = parts[0]
+            let isWireless = serial.contains(":")
+            switch parts[1] {
+            case "unauthorized":
+                result.append(DeviceInfo(model: "unauthorized", serial: serial,
+                                         isWireless: isWireless, unauthorized: true))
+            case "device":
+                var model = "device"
                 if let range = s.range(of: #"model:(\S+)"#, options: .regularExpression) {
-                    let model = String(s[range]).replacingOccurrences(of: "model:", with: "")
-                    return DeviceInfo(model: model.replacingOccurrences(of: "_", with: " "), isWireless: isWireless)
+                    model = String(s[range])
+                        .replacingOccurrences(of: "model:", with: "")
+                        .replacingOccurrences(of: "_", with: " ")
                 }
-                return DeviceInfo(model: "device", isWireless: isWireless)
+                result.append(DeviceInfo(model: model, serial: serial,
+                                         isWireless: isWireless, unauthorized: false))
+            default:
+                continue
             }
         }
-        return DeviceInfo(model: nil, isWireless: false)
+        return result
     }
 
     private var isRunning: Bool {
         runningProcess?.isRunning ?? false
+    }
+
+    // MARK: - adb helpers
+
+    private func adbArgs(_ args: [String], serial: String?) -> [String] {
+        if let serial { return ["-s", serial] + args }
+        return args
+    }
+
+    /// One UI version as a Double (e.g. 8.5), or nil when undetectable.
+    private func detectOneUI(serial: String?, completion: @escaping (Double?) -> Void) {
+        guard let adb = adbPath else { completion(nil); return }
+        runProcess(adb, adbArgs(["shell", "getprop", "ro.build.version.oneui"], serial: serial),
+                   timeout: 5) { status, out in
+            let v = Double(out.trimmingCharacters(in: .whitespacesAndNewlines))
+            completion(status == 0 ? v : nil)
+        }
+    }
+
+    // MARK: - Overlay display (One UI 8.5 path)
+
+    /// Currently existing display ids, parsed from `dumpsys display`.
+    private func displayIds(serial: String?, completion: @escaping (Set<String>) -> Void) {
+        guard let adb = adbPath else { completion([]); return }
+        runProcess(adb, adbArgs(["shell", "dumpsys", "display"], serial: serial),
+                   timeout: 6) { _, out in
+            var ids = Set<String>()
+            if let re = try? NSRegularExpression(pattern: #"mDisplayId=(\d+)"#) {
+                let ns = out as NSString
+                for m in re.matches(in: out, range: NSRange(location: 0, length: ns.length)) {
+                    ids.insert(ns.substring(with: m.range(at: 1)))
+                }
+            }
+            completion(ids)
+        }
+    }
+
+    /// Create the hdmi-tagged overlay display, wait for its id, then attach scrcpy.
+    private func launchOverlayAndRun() {
+        guard adbPath != nil else { return }
+        let serial = selectedDevice?.serial
+        let spec = "\(selectedResolution)/\(selectedDPI),hdmi"
+        log("Creating overlay display (\(spec)) …")
+        displayIds(serial: serial) { [weak self] before in
+            guard let self, let adb = self.adbPath else { return }
+            runProcess(adb, self.adbArgs(["shell", "settings", "put", "global",
+                                          "overlay_display_devices", spec], serial: serial),
+                       timeout: 5) { status, _ in
+                guard status == 0 else {
+                    self.log("settings put overlay_display_devices failed (\(status))")
+                    self.showLaunchFailure()
+                    return
+                }
+                self.waitForNewDisplay(before: before, serial: serial, attemptsLeft: 12) { newId in
+                    guard let newId else {
+                        self.log("No new display id appeared; cleaning up overlay")
+                        self.cleanupOverlay(serial: serial) {
+                            self.showLaunchFailure()
+                        }
+                        return
+                    }
+                    self.overlayInUse = true
+                    self.log("Overlay display id: \(newId)")
+                    self.runScrcpy(mode: .overlay(newId))
+                }
+            }
+        }
+    }
+
+    /// Poll `dumpsys display` until a display id that wasn't in `before` shows up.
+    private func waitForNewDisplay(before: Set<String>, serial: String?,
+                                   attemptsLeft: Int,
+                                   completion: @escaping (String?) -> Void) {
+        guard attemptsLeft > 0 else { completion(nil); return }
+        displayIds(serial: serial) { now in
+            if let newId = now.subtracting(before).first {
+                completion(newId)
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    self.waitForNewDisplay(before: before, serial: serial,
+                                           attemptsLeft: attemptsLeft - 1,
+                                           completion: completion)
+                }
+            }
+        }
+    }
+
+    /// Remove the overlay display we created. Without this, a ghost display would
+    /// linger on the phone after DeX stops.
+    private func cleanupOverlay(serial: String?, completion: @escaping () -> Void) {
+        guard overlayInUse, let adb = adbPath else { completion(); return }
+        overlayInUse = false
+        log("Removing overlay display")
+        runProcess(adb, adbArgs(["shell", "settings", "delete", "global",
+                                 "overlay_display_devices"], serial: serial),
+                   timeout: 5) { _, _ in completion() }
     }
 
     // MARK: - Menu construction
@@ -165,8 +338,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let statusTitle: String
         if isRunning {
             statusTitle = "● DeX running"
-        } else if let dev = connectedDevice {
-            statusTitle = dev == "⚠︎ unauthorized" ? "⚠︎ USB debugging not authorized" : "Connected: \(dev)"
+        } else if let dev = selectedDevice {
+            statusTitle = "Connected: \(dev.model)"
+        } else if hasUnauthorized {
+            statusTitle = "⚠︎ USB debugging not authorized"
         } else {
             statusTitle = "No device connected"
         }
@@ -183,11 +358,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             let start = NSMenuItem(title: "Start DeX", action: #selector(startDeX), keyEquivalent: "d")
             start.target = self
-            let canStart = connectedDevice != nil && connectedDevice != "⚠︎ unauthorized"
-            start.isEnabled = canStart
+            start.isEnabled = selectedDevice != nil
             menu.addItem(start)
         }
         menu.addItem(.separator())
+
+        // Device picker (only when there's something to pick between)
+        if devices.count > 1 {
+            let devItem = NSMenuItem(title: "Device", action: nil, keyEquivalent: "")
+            let devMenu = NSMenu()
+            for d in devices where !d.unauthorized {
+                let title = d.isWireless ? "\(d.model) (WiFi)" : d.model
+                let mi = NSMenuItem(title: title, action: #selector(pickDevice(_:)), keyEquivalent: "")
+                mi.target = self
+                mi.representedObject = d.serial
+                mi.state = (d.serial == selectedDevice?.serial) ? .on : .off
+                devMenu.addItem(mi)
+            }
+            devItem.submenu = devMenu
+            menu.addItem(devItem)
+        }
+
+        // Display mode submenu
+        let modeItem = NSMenuItem(title: "Display mode", action: nil, keyEquivalent: "")
+        let modeMenu = NSMenu()
+        let modeLabels = [
+            "auto": "Auto (recommended)",
+            "new-display": "Virtual display (One UI 8.0)",
+            "overlay": "Overlay display (One UI 8.5+)",
+        ]
+        for m in displayModePrefs {
+            let mi = NSMenuItem(title: modeLabels[m] ?? m, action: #selector(pickDisplayMode(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = m
+            mi.state = (m == displayModePref) ? .on : .off
+            modeMenu.addItem(mi)
+        }
+        modeItem.submenu = modeMenu
+        menu.addItem(modeItem)
 
         // Resolution submenu
         let resItem = NSMenuItem(title: "Resolution", action: nil, keyEquivalent: "")
@@ -245,26 +453,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let d = sender.representedObject as? Int { selectedDPI = d }
     }
 
+    @objc private func pickDisplayMode(_ sender: NSMenuItem) {
+        if let m = sender.representedObject as? String { displayModePref = m }
+    }
+
+    @objc private func pickDevice(_ sender: NSMenuItem) {
+        if let s = sender.representedObject as? String { selectedSerial = s }
+    }
+
     @objc private func startDeX() {
         guard scrcpyPath != nil, !isRunning else { return }
+        reconnectAttempts = 0
+        triedOverlayFallback = false
         // Confirm connection / wireless state off the main thread, then launch —
         // regardless of whether the menu was opened first.
-        queryDevices { [weak self] info in
+        queryDevices { [weak self] found in
             guard let self else { return }
-            self.connectedDevice = info.model
-            self.deviceIsWireless = info.isWireless
-            self.launchScrcpy()
+            self.devices = found
+            guard self.selectedDevice != nil else { self.rebuildMenu(); return }
+            self.launchSession()
         }
     }
 
-    private func launchScrcpy() {
+    /// Decide which display-creation path to use, then launch scrcpy.
+    private func launchSession() {
+        switch displayModePref {
+        case "new-display":
+            runScrcpy(mode: .newDisplay)
+        case "overlay":
+            launchOverlayAndRun()
+        default: // auto — One UI 8.5 broke full DeX over --new-display
+            detectOneUI(serial: selectedDevice?.serial) { [weak self] version in
+                guard let self else { return }
+                if let v = version, v >= 8.5 {
+                    self.launchOverlayAndRun()
+                } else {
+                    self.runScrcpy(mode: .newDisplay)
+                }
+            }
+        }
+    }
+
+    private func runScrcpy(mode: DisplayMode) {
         guard let scrcpy = scrcpyPath, !isRunning else { return }
+        truncateLog()
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: scrcpy)
-        var args = ["--new-display=\(selectedResolution)/\(selectedDPI)"]
+
+        var args: [String]
+        switch mode {
+        case .newDisplay:
+            args = ["--new-display=\(selectedResolution)/\(selectedDPI)"]
+        case .overlay(let id):
+            args = ["--display-id=\(id)"]
+        }
+        if let serial = selectedDevice?.serial {
+            args += ["-s", serial]
+        }
         // Over WiFi, tune for smoothness: h265 (lighter bandwidth), a small buffer
         // to absorb jitter, a capped frame rate, and no audio overhead. USB stays lean.
-        if deviceIsWireless {
+        let wireless = selectedDevice?.isWireless ?? false
+        if wireless {
             args += [
                 "--video-codec=h265",
                 "--video-bit-rate=8M",
@@ -288,19 +537,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         userRequestedStop = false
+        sessionSerial = selectedDevice?.serial
+        sessionWasWireless = wireless
+        activeDisplayMode = mode
         let launchDate = Date()
         proc.terminationHandler = { [weak self] process in
             DispatchQueue.main.async {
                 guard let self else { return }
+                let uptime = Date().timeIntervalSince(launchDate)
                 self.runningProcess = nil
-                self.rebuildMenu()
+
+                // Wireless link dropped mid-session: try to reconnect adb and relaunch.
+                if !self.userRequestedStop, self.sessionWasWireless,
+                   uptime > 5, self.reconnectAttempts < self.maxReconnectAttempts,
+                   let serial = self.sessionSerial {
+                    self.reconnectAttempts += 1
+                    self.attemptReconnect(serial: serial)
+                    return
+                }
+
                 // If scrcpy died on its own within a couple of seconds, it almost
                 // certainly failed to start (device gone, unauthorized, etc.).
                 if !self.userRequestedStop,
-                   Date().timeIntervalSince(launchDate) < 2.5,
-                   process.terminationStatus != 0 {
+                   uptime < 2.5, process.terminationStatus != 0 {
+                    // One UI 8.5 silently rejects full DeX on --new-display; retry
+                    // once via the overlay path before surfacing an error.
+                    if self.activeDisplayMode == .newDisplay,
+                       self.displayModePref == "auto", !self.triedOverlayFallback {
+                        self.triedOverlayFallback = true
+                        self.log("--new-display failed fast; retrying with overlay display")
+                        self.launchOverlayAndRun()
+                        return
+                    }
                     self.showLaunchFailure()
                 }
+                self.rebuildMenu()
             }
         }
         do {
@@ -311,6 +582,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             showLaunchFailure()
         }
         rebuildMenu()
+    }
+
+    /// Reconnect adb over WiFi and relaunch with the same display mode.
+    private func attemptReconnect(serial: String) {
+        guard let adb = adbPath else { return }
+        log("Connection lost; reconnecting to \(serial) …")
+        runProcess(adb, ["connect", serial], timeout: 8) { [weak self] status, out in
+            guard let self else { return }
+            guard status == 0, out.contains("connected") else {
+                self.log("Reconnect failed (\(status))")
+                self.rebuildMenu()
+                return
+            }
+            // Give the adb server a moment to settle before scrcpy attaches.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                self.log("Reconnected; restarting DeX")
+                if self.activeDisplayMode?.isOverlay == true {
+                    // The old overlay id may be stale; recreate from scratch.
+                    self.cleanupOverlay(serial: serial) {
+                        self.launchOverlayAndRun()
+                    }
+                } else {
+                    self.runScrcpy(mode: .newDisplay)
+                }
+            }
+        }
     }
 
     private func showLaunchFailure() {
@@ -327,6 +624,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         userRequestedStop = true
         runningProcess?.terminate()
         runningProcess = nil
+        cleanupOverlay(serial: sessionSerial) {}
         rebuildMenu()
     }
 
@@ -340,13 +638,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func quit() {
         userRequestedStop = true
         runningProcess?.terminate()
-        NSApp.terminate(nil)
+        cleanupOverlay(serial: sessionSerial) {
+            NSApp.terminate(nil)
+        }
+    }
+
+    // MARK: - Log
+
+    /// Start each session with a fresh log (FileHandle writes from offset 0 but does
+    /// not truncate, so without this a short new log would leave stale trailing bytes).
+    private func truncateLog() {
+        FileManager.default.createFile(atPath: logPath, contents: nil)
+    }
+
+    private func log(_ message: String) {
+        guard let handle = FileHandle(forWritingAtPath: logPath) else { return }
+        defer { try? handle.close() }
+        let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+        if let data = line.data(using: .utf8) {
+            do {
+                try handle.seekToEnd()
+                try handle.write(contentsOf: data)
+            } catch {}
+        }
     }
 
     private func logFileHandle() -> FileHandle? {
-        let fm = FileManager.default
-        if !fm.fileExists(atPath: logPath) {
-            fm.createFile(atPath: logPath, contents: nil)
+        if !FileManager.default.fileExists(atPath: logPath) {
+            FileManager.default.createFile(atPath: logPath, contents: nil)
         }
         return FileHandle(forWritingAtPath: logPath)
     }

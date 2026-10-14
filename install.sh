@@ -29,9 +29,10 @@ DPI="${DPI:-160}"
 
 DISPLAY_ARG="${RES}/${DPI}"
 
-# 4. Shell alias
+# 4. Shell alias — absolute paths with ADB set explicitly, so every new shell
+#    doesn't pay for a `brew shellenv` eval just to run dex.
 SHELL_RC="$HOME/.zshrc"
-ALIAS_LINE="alias dex=\"eval \\\"\$(${BREW_PREFIX}/bin/brew shellenv)\\\"; scrcpy --new-display=${DISPLAY_ARG}\""
+ALIAS_LINE="alias dex=\"ADB=${BREW_PREFIX}/bin/adb ${BREW_PREFIX}/bin/scrcpy --new-display=${DISPLAY_ARG}\""
 touch "$SHELL_RC"
 if grep -q "^alias dex=" "$SHELL_RC"; then
   grep -v "^alias dex=" "$SHELL_RC" > "$SHELL_RC.tmp" || true
@@ -47,7 +48,7 @@ fi
 APP_PATH="$HOME/Desktop/DeX.app"
 TMP_SCPT="$(mktemp /tmp/dex_launcher.XXXXXX.applescript)"
 cat > "$TMP_SCPT" <<EOF
-do shell script "eval \\"\$(${BREW_PREFIX}/bin/brew shellenv)\\"; nohup scrcpy --new-display=${DISPLAY_ARG} > /tmp/dex_scrcpy.log 2>&1 & disown"
+do shell script "ADB=${BREW_PREFIX}/bin/adb nohup ${BREW_PREFIX}/bin/scrcpy --new-display=${DISPLAY_ARG} > /tmp/dex_scrcpy.log 2>&1 & disown"
 EOF
 rm -rf "$APP_PATH"
 osacompile -o "$APP_PATH" "$TMP_SCPT"

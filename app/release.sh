@@ -2,14 +2,15 @@
 set -euo pipefail
 
 # Build DeXBar.app and package it into a distributable .zip.
-# Usage: ./release.sh        -> produces build/DeXBar-macos.zip + a SHA-256
+# Usage: ./release.sh [version]  -> produces build/DeXBar-macos.zip + a SHA-256
+#   version defaults to `git describe --tags` (leading "v" stripped).
 #
 # To cut a GitHub release, tag and push — CI builds and attaches the .zip:
 #   git tag v1.0.0 && git push origin v1.0.0
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
-"$HERE/build.sh"
+"$HERE/build.sh" "" "${1:-}"
 
 cd "$HERE/build"
 rm -f DeXBar-macos.zip

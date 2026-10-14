@@ -113,14 +113,28 @@ USB 启动保持精简（不加缓冲/延迟），因为链路本身已经稳定
 是接近桌面的合理默认值。在 DeXBar 里直接从菜单选即可。用 `install.sh` 时，重新运行它，或编辑
 `~/.zshrc` 里 `dex` 别名的 `--new-display=宽x高/DPI` 数值。
 
+## One UI 8.5 说明
+
+在 **One UI 8.5** 上，`scrcpy --new-display` 已无法启动完整的 DeX——得到的只是安卓原生桌面模式
+（应用全屏打开、没有窗口标题栏、无法多窗口）。本项目通过创建带 `hdmi` 标记的
+[overlay 显示器](https://github.com/yongtingzhengcn-web/dex-for-mac/issues/1)
+（`settings put global overlay_display_devices "宽x高/DPI,hdmi"`）绕过：One UI 会把它当作
+外接显示器，从而启动完整的 DeX，然后 scrcpy 按 display id 连接这个显示器。
+
+无需手动操作：**DeXBar** 和 **wireless.sh** 会自动检测 One UI 版本并选择正确的路径。在 DeXBar 里
+也可以通过 *Display mode* 菜单手动强制 `Virtual display (One UI 8.0)` 或 `Overlay display (One UI 8.5+)`。
+
 ## 工作原理
 
 ```bash
-scrcpy --new-display=1920x1080/160
+scrcpy --new-display=1920x1080/160          # One UI 8.0
+# 在 One UI 8.5+ 上：
+adb shell settings put global overlay_display_devices "1920x1080/160,hdmi"
+scrcpy --display-id=<从 dumpsys display 获取的 id>
 ```
 
-这一条命令在手机上按给定分辨率/密度创建一个新的虚拟显示器，触发 One UI 8 的桌面模式（DeX）
-渲染到它上面，再通过 USB（或无线 adb）把这个显示器投到 Mac 的一个窗口里。DeXBar 就是围绕这条
+第一条命令在手机上按给定分辨率/密度创建一个新的虚拟显示器，触发 One UI 8 的桌面模式（DeX）
+渲染到它上面，再通过 USB（或无线 adb）把这个显示器投到 Mac 的一个窗口里。DeXBar 就是围绕这些
 命令、外加 `adb devices` 状态检测的一层轻量原生封装。
 
 ## 许可证
