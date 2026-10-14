@@ -17,9 +17,33 @@
 
 ## 两种使用方式
 
-### 方式 A —— DeXBar 菜单栏 App（推荐）
+### 方式 A —— DeXClient 原生客户端（推荐）
 
-一个原生菜单栏 App：选分辨率/DPI、查看手机是否已连接、启停 DeX —— 全在菜单栏完成，无需终端。
+一个真正的窗口客户端，无需 Homebrew、无需终端：scrcpy server 和 adb 已内置在 App 里。
+视频流用 VideoToolbox 硬解、Metal 渲染到 App 自己的窗口——鼠标点击、触控板滚动、键盘输入、
+剪贴板粘贴（Cmd+V 把 Mac 剪贴板粘贴进手机）、手机→Mac 剪贴板同步都是原生支持的。
+音频也会转发（raw PCM）通过 Mac 播放。
+
+从 [最新 release](https://github.com/yongtingzhengcn-web/dex-for-mac/releases/latest) 下载，
+解压后把 `DeXClient.app` 拖进应用程序目录。它是 ad-hoc 签名（未公证），首次启动需**右键 → 打开**，
+或在 *系统设置 → 隐私与安全性* 中允许。
+
+也可以自己构建（自动下载钉死版本的 scrcpy server 和 Google platform-tools，校验 SHA-256，
+编译 universal 二进制）：
+
+```bash
+git clone https://github.com/yongtingzhengcn-web/dex-for-mac.git
+cd dex-for-mac/client
+./build.sh
+open build/DeXClient.app     # 可选：cp -R build/DeXClient.app /Applications/
+```
+
+所有功能都在 **Session** 菜单里：启动/停止、设备选择、无线连接（按 IP）、显示模式、分辨率、DPI、音频开关。
+
+### 方式 B —— DeXBar 菜单栏 App
+
+一个轻量菜单栏 App，驱动你本机安装的 `scrcpy`：选分辨率/DPI、查看手机是否已连接、启停 DeX，
+全在菜单栏完成。
 
 ```bash
 git clone https://github.com/yongtingzhengcn-web/dex-for-mac.git
@@ -44,7 +68,7 @@ brew install --cask android-platform-tools
 
 设置在重启后保留。App 仅在菜单栏运行（无程序坞图标）。
 
-### 方式 B —— install.sh（终端别名 + 桌面启动器）
+### 方式 C —— install.sh（终端别名 + 桌面启动器）
 
 如果你不想用图形界面，这个脚本会装好工具，并设置一个 `dex` 命令，外加在桌面生成一个固定
 分辨率/DPI、可双击的 `DeX.app`。

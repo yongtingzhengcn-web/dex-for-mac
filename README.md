@@ -23,10 +23,37 @@ just from a USB cable.
 
 ## Two ways to use it
 
-### Option A — DeXBar menu-bar app (recommended)
+### Option A — DeXClient native app (recommended)
 
-A native menu-bar app: pick resolution/DPI, see whether your phone is connected,
-and start/stop DeX — all from the menu bar, no terminal.
+A real windowed client, no Homebrew or terminal needed: the scrcpy server and adb
+are bundled inside the app. The video stream is decoded with VideoToolbox and
+rendered with Metal in the app's own window — mouse clicks, trackpad scrolling,
+keyboard, clipboard paste (Cmd+V pastes your Mac clipboard into the phone) and
+device→Mac clipboard sync all work natively. Audio is forwarded (raw PCM) and
+plays through the Mac.
+
+**Download a prebuilt build** from the [latest release](https://github.com/yongtingzhengcn-web/dex-for-mac/releases/latest),
+unzip, and move `DeXClient.app` to Applications. It's ad-hoc signed (not notarized), so on
+first launch **right-click the app → Open**, or allow it under *System Settings → Privacy
+& Security*.
+
+Or build it yourself (downloads the pinned scrcpy server + Google platform-tools,
+checksum-verified, then compiles a universal binary):
+
+```bash
+git clone https://github.com/yongtingzhengcn-web/dex-for-mac.git
+cd dex-for-mac/client
+./build.sh
+open build/DeXClient.app     # optionally: cp -R build/DeXClient.app /Applications/
+```
+
+Everything is in the **Session** menu: Start/Stop, device picker, wireless
+connect (by IP), display mode, resolution, DPI, audio toggle.
+
+### Option B — DeXBar menu-bar app
+
+A lightweight menu-bar app that drives an installed `scrcpy`: pick resolution/DPI,
+see whether your phone is connected, and start/stop DeX — all from the menu bar.
 
 **Download a prebuilt build** from the [latest release](https://github.com/yongtingzhengcn-web/dex-for-mac/releases/latest),
 unzip, and move `DeXBar.app` to Applications. It's ad-hoc signed (not notarized), so on
@@ -63,7 +90,7 @@ Click the display icon in the menu bar:
 
 Settings persist across restarts. The app runs menu-bar-only (no Dock icon).
 
-### Option B — install.sh (terminal alias + Desktop launcher)
+### Option C — install.sh (terminal alias + Desktop launcher)
 
 If you prefer no GUI, this installs the tools and sets up a `dex` command plus a
 double-clickable `DeX.app` on your Desktop at a fixed resolution/DPI.
