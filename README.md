@@ -17,7 +17,7 @@ just from a USB cable.
 ## Requirements
 
 - macOS 13+
-- A Samsung Galaxy phone/tablet running **One UI 8 or later** (Android 16+)
+- A Samsung Galaxy phone/tablet running **One UI 8.5 or later** (Android 16+)
 - USB cable
 - [Homebrew](https://brew.sh)
 
@@ -138,14 +138,28 @@ or edit the `--new-display=WIDTHxHEIGHT/DPI` value in the `dex` alias (`~/.zshrc
 
 ## How it works
 
+DeXBar asks Android for a virtual display flagged as HDMI, then mirrors it:
+
 ```bash
-scrcpy --new-display=1920x1080/160
+adb shell settings put global overlay_display_devices "1920x1080/160,hdmi"
+# read the new display id back out of dumpsys
+adb shell dumpsys display | grep mDisplayId
+scrcpy --display-id=<id>
 ```
 
-This one command creates a new virtual display on the phone at the given
-resolution/density, which triggers One UI 8's Desktop Mode (DeX) to render onto it,
-and mirrors that display to a window on your Mac over USB (or wireless adb). DeXBar is
-a thin native wrapper around exactly this command plus `adb devices` for status.
+The `hdmi` flag is the important part: it makes One UI treat the virtual display as an
+external monitor, which is what triggers full DeX windowing — multi-window with title
+bars and minimise/restore — rather than the plainer Android Desktop Mode that
+`scrcpy --new-display` gets you on newer builds.
+
+DeXBar records the display ids before creating one, waits for the new id to appear,
+connects scrcpy to it, and deletes the overlay display when DeX stops so nothing is
+left behind on the phone.
+
+> **One UI 8.5 or later is required.** On earlier builds the overlay-display path has
+> not been verified; if you are on One UI 8.0 and need it, use v1.0.1 from
+> [releases](https://github.com/yongtingzhengcn-web/dex-for-mac/releases), which still
+> uses `--new-display`.
 
 ## Support
 
